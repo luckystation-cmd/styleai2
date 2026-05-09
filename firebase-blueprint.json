@@ -1,0 +1,56 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "User account data including credits",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email", "description": "Verified email of the user" },
+        "credits": { "type": "integer", "description": "Remaining analysis credits", "minimum": 0 },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last activity timestamp" }
+      },
+      "required": ["email", "credits", "updatedAt"]
+    },
+    "TopUp": {
+      "title": "Recharge Request",
+      "description": "Request to add credits via payment",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "The UID of the requesting user" },
+        "email": { "type": "string", "description": "Email of the user at time of request" },
+        "amount": { "type": "integer", "minimum": 1 },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "txId": { "type": "string", "description": "Transaction ID or link to proof", "maxLength": 512 },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "email", "amount", "status", "txId", "createdAt"]
+    },
+    "Probe": {
+      "title": "URL Probe History",
+      "description": "Record of a previously analyzed URL with metadata",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string" },
+        "url": { "type": "string" },
+        "siteName": { "type": "string" },
+        "screenshotUrl": { "type": "string" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "url", "siteName", "timestamp"]
+    }
+  },
+  "firestore": {
+    "users/{userId}": {
+      "schema": "User",
+      "description": "User specific configuration and credits"
+    },
+    "recharges/{rechargeId}": {
+      "schema": "TopUp",
+      "description": "History of recharge requests"
+    },
+    "probes/{probeId}": {
+      "schema": "Probe",
+      "description": "History of analyzed URLs"
+    }
+  }
+}

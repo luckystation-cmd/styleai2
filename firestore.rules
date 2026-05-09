@@ -1,0 +1,125 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // 1. Primitive Definitions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    // Admin helper
+    function isAdmin() {
+      return isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+    }
+
+    // 2. Collection Rules
+
+    match /users/{userId} {
+      function isValidUser(data) {
+        return data.keys().hasAll(['email', 'credits', 'updatedAt']) 
+          && data.email is string 
+          && data.credits is int
+          && data.credits >= 0
+          && data.updatedAt == request.time;
+      }
+
+      // Fast get for owners
+      allow get: if isSignedIn() && request.auth.uid == userId;
+      
+      // Admin bypass for get
+      allow get: if isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid));
+      
+      // Allow user to initialize their own record
+      allow create: if isOwner(userId) 
+        && isValidUser(incoming())
+        && incoming().credits == 10;
+        
+      // Update gates
+      allow update: if isOwner(userId)
+        && isValidUser(incoming())
+        && incoming().email == existing().email
+        && (
+          // Action: Consume Credit
+          (incoming().credits == existing().credits - 1 && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['credits', 'updatedAt'])) ||
+          // Action: Recharge
+          (incoming().credits == existing().credits + 10 && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['credits', 'updatedAt'])) ||
+          // Action: Profile Update
+          (incoming().credits == existing().credits && request.resource.data.diff(resource.data).affectedKeys().hasAny(['displayName', 'updatedAt'])) ||
+          (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)))
+        );
+    }
+
+    match /recharges/{rechargeId} {
+      function isValidRecharge(data) {
+        return data.keys().hasAll(['userId', 'email', 'amount', 'status', 'txId', 'createdAt'])
+          && data.keys().size() == 6
+          && data.userId == request.auth.uid
+          && data.email == request.auth.token.email
+          && data.amount is int
+          && data.amount > 0
+          && data.status == 'approved'
+          && data.txId is string
+          && data.txId.size() > 0
+          && data.txId.size() <= 512
+          && data.createdAt == request.time;
+      }
+
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if (isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin())) && isValidId(rechargeId);
+      
+      allow create: if isValidId(rechargeId) 
+        && isSignedIn() 
+        && isValidRecharge(incoming())
+        // Atomicity Guarantee: Ensure user credits are incremented in the same atomic batch
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.credits == get(/databases/$(database)/documents/users/$(request.auth.uid)).data.credits + incoming().amount;
+        
+      allow update, delete: if isAdmin() && isValidId(rechargeId);
+    }
+
+    match /probes/{probeId} {
+      function isValidProbe(data) {
+        return data.keys().hasAll(['userId', 'url', 'timestamp'])
+          && data.userId == request.auth.uid
+          && data.url is string
+          && data.timestamp == request.time;
+      }
+
+      allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+      allow get: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow create: if isSignedIn() && isValidProbe(incoming());
+      allow delete: if isSignedIn() && (resource.data.userId == request.auth.uid || isAdmin());
+      allow update: if false; 
+    }
+    
+    // Admin list setup - empty by default, but allows for expansion
+    match /admins/{adminId} {
+      allow read: if isSignedIn();
+      allow write: if false; // Only manageable via Google Cloud Console
+    }
+  }
+}
