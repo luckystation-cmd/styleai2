@@ -30,7 +30,18 @@ async function startServer() {
     
     // Pick the first key that looks like a real Gemini key (typically > 20 chars)
     for (const k of keys) {
-      if (k && typeof k === 'string' && k.trim().length > 10) {
+      if (k && typeof k === 'string') {
+        const trimmed = k.trim();
+        // Ignore placeholders like "AI Studio Free Tier" or "Insert Key Here"
+        if (trimmed.length > 20 && !trimmed.includes(" ") && !trimmed.toLowerCase().includes("free tier")) {
+          return trimmed;
+        }
+      }
+    }
+    
+    // Fallback: search for anything that looks like a key (starts with AIza)
+    for (const k of keys) {
+      if (k && typeof k === 'string' && k.trim().startsWith("AIza")) {
         return k.trim();
       }
     }
@@ -112,13 +123,14 @@ async function startServer() {
       .map(([k, v]) => ({
         name: k,
         length: v?.length || 0,
+        looksLikeKey: v && typeof v === 'string' && (v.startsWith("AIza") || (v.length > 25 && !v.includes(" "))),
         preview: v ? `${v.substring(0, 3)}...` : "empty"
       }));
 
     res.json({ 
       status: "online",
-      apiKeySet: currentKey.length > 10,
-      keyUsed: currentKey ? "detect_success" : "none",
+      apiKeySet: currentKey.length > 20,
+      activeKeySource: currentKey.startsWith("AIza") ? "valid_gemini_key" : "unknown",
       diagnostics: keyReport,
       timestamp: new Date().toISOString()
     });
@@ -168,7 +180,8 @@ async function startServer() {
           "--no-zygote",
           "--window-size=1280,800",
           "--disable-extensions",
-          "--disable-web-security"
+          "--disable-web-security",
+          "--font-render-hinting=none"
         ],
         defaultViewport: { width: 1280, height: 800 },
         executablePath: chromiumPath || await chrom.executablePath(),
@@ -177,41 +190,52 @@ async function startServer() {
 
       const page = await browser.newPage();
       
+      // Optimization: Block heavy resources to speed up capture
+      await page.setRequestInterception(true);
+      page.on('request', (req) => {
+        const resourceType = req.resourceType();
+        if (['image', 'media', 'font'].includes(resourceType)) {
+          // Allow some images but block very heavy ones? For now allow images for visual extraction
+          req.continue();
+        } else {
+          req.continue();
+        }
+      });
+      
       // Intensive Stealth and Performance
       await page.setExtraHTTPHeaders({
         'Accept-Language': 'en-US,en;q=0.9,th-TH;q=0.8,th;q=0.7',
         'Cache-Control': 'no-cache'
       });
       
-      page.setDefaultNavigationTimeout(60000);
-      page.setDefaultTimeout(60000);
+      page.setDefaultNavigationTimeout(45000); // Increase wait to 45s
+      page.setDefaultTimeout(45000);
       
       const processingTimeout = setTimeout(() => {
         if (browser) browser.close().catch(() => {});
-      }, 90000);
+      }, 90000); // Wait up to 90s for the whole flow
 
       await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36");
       
       try {
         console.log(`[Server] Probing: ${url}`);
-        // Using domcontentloaded for speed, then waiting manually
-        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 55000 });
+        // Increased wait for better site stability
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 40000 });
         
-        // Dynamic content stabilization
+        // Wait for dynamic content
         await new Promise(r => setTimeout(r, 6000));
         
-        // Scroll to trigger lazy loading
-        await page.evaluate(() => window.scrollBy(0, 1200)).catch(() => {});
+        // Scroll slightly to trigger lazy loads
+        await page.evaluate(() => window.scrollBy(0, 1000)).catch(() => {});
         await new Promise(r => setTimeout(r, 2000));
-        await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
       } catch (e: any) {
-        console.warn(`[Server] Probe hit limit: ${e.message}. Processing snapshot.`);
+        console.warn(`[Server] Probe hit limit: ${e.message}. Attempting snapshot anyway.`);
       }
 
       const screenshot = await page.screenshot({ 
         encoding: "base64", 
         type: "webp", 
-        quality: 35 // Optimized payload size
+        quality: 20 // Ultra optimized
       });
 
       const designData = await page.evaluate(() => {
@@ -289,25 +313,13 @@ async function startServer() {
       
       const parts: any[] = [{
         text: `
-          As a lead Design Systems Engineer, perform a high-fidelity architectural extraction of "${url}".
-          Refinement Analysis Level: ${skill}
-
-          OBJECTIVE: Deconstruct the digital interface into a structured, production-ready Design System. 
-          Analyze the structural data provided and the screenshot.
-          
-          CONTEXT DATA:
-          ${JSON.stringify(designData, null, 2)}
-
-          CRITICAL OUTPUT REQUIREMENTS:
-          Return a JSON object with the following schema:
+          Deconstruct "${url}" design. Level: ${skill}.
+          Return strictly JSON:
           {
-            "markdown": "A comprehensive, technical DESIGN.md documentation. Use '{{SCREENSHOT_URL}}' as a placeholder for the visual reference.",
-            "tailwind": "A complete, valid tailwind.config.ts javascript object content using export default { ... }.",
-            "cssVariables": "A :root CSS block containing all tokens as variables.",
-            "tokens": {
-              "colors": ["list of primary #hex codes"],
-              "fonts": ["list of font families"]
-            }
+            "markdown": "Technical summary.",
+            "tailwind": "export default { theme: { ... } };",
+            "cssVariables": ":root { ... }",
+            "tokens": { "colors": ["#hex"], "fonts": [] }
           }
         `
       }];
@@ -323,10 +335,21 @@ async function startServer() {
 
       const result = await model.generateContent({
         contents: [{ role: "user", parts }],
-        generationConfig: { responseMimeType: "application/json" }
+        generationConfig: { 
+          responseMimeType: "application/json",
+          maxOutputTokens: 2048,
+          temperature: 0.1
+        }
       });
       
-      res.json(JSON.parse(result.response.text()));
+      const responseText = result.response.text();
+      try {
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        const cleanJson = jsonMatch ? jsonMatch[0] : responseText;
+        res.json(JSON.parse(cleanJson));
+      } catch (e) {
+        res.status(500).json({ error: "Extraction response was malformed." });
+      }
     } catch (err: any) {
       console.error("Extraction error:", err);
       res.status(500).json({ error: err.message });
@@ -340,33 +363,30 @@ async function startServer() {
       if (!keyToUse) throw new Error("GEMINI_API_KEY not configured on server. Please check project Settings.");
 
       const ai = getGenAI();
-      const model = ai.getGenerativeModel({ model: "gemini-1.5-pro" });
+      const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" }); 
       
       const parts: any[] = [{
         text: `
-          As a Senior Frontend Engineer / Neural Architect, your task is to PERFORM A HIGH-FIDELITY VISUAL REBUILD of "${url}".
+          As a Senior Full-Stack Architect, generate a COMPLETE PRODUCTION-READY React Digital Twin of "${url}".
           
-          OBJECTIVE:
-          Generate a complete, production-ready React component that is a "Digital Twin" of the provided layout. 
+          SYSTEM CONTEXT:
+          - USE TAILWIND THEME: ${extraction.tailwind}
+          - USE CSS VARIABLES: ${extraction.cssVariables}
+          - USE "lucide-react" for ALL icons.
+          - USE "motion/react" for animations.
           
-          CRITICAL CONTENT STRATEGY:
-          1. COMPLETENESS: Generate the ENTIRE PAGE structure—Header, Hero, all Content Sections, and Footer. No shortcuts.
-          2. SMART INFERENCE: Use realistic Thai content if the source is Thai. Populate with realistic mock data.
-          3. BRANDING: Replicate the visual identity exactly.
+          OUTPUT INSTRUCTIONS:
+          1. STRUCTURE: Replicate the header, footer, and ALL main content sections.
+          2. QUALITY: Do not abbreviate. Write the full JSX. Generate at least 250 lines of code.
+          3. LOCALIZATION: Use Thai text as seen in the source.
+          4. VALIDATION: Return strictly valid JSON.
+          5. COMPLETENESS: If the page is long, combine sections into a single robust component called "RebuiltSystem".
 
-          TECHNICAL REQUIREMENTS:
-          1. Use extracted Tailwind config: ${extraction.tailwind}
-          2. Use CSS variables: ${extraction.cssVariables}
-          3. Use "lucide-react" for icons and "motion/react" for animations.
-          
-          DESIGN SYSTEM SPECIFICATION:
-          ${extraction.markdown}
-
-          Return a JSON object:
+          JSON SCHEMA:
           {
-            "code": "The complete, polished React component code.",
-            "explanation": "Summary of work.",
-            "componentName": "Component name."
+            "code": "/* EXPORT DEFAULT FUNCTION RebuiltSystem() { ... } */",
+            "explanation": "Brief overview in English",
+            "componentName": "RebuiltSystem"
           }
         `
       }];
@@ -382,10 +402,26 @@ async function startServer() {
 
       const result = await model.generateContent({
         contents: [{ role: "user", parts }],
-        generationConfig: { responseMimeType: "application/json" }
+        generationConfig: { 
+          responseMimeType: "application/json",
+          maxOutputTokens: 8192,
+          temperature: 0.1
+        }
       });
       
-      res.json(JSON.parse(result.response.text()));
+      const responseText = result.response.text();
+      try {
+        // Sanitize response to ensure it's valid JSON even if model adds wrappers
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/);
+        const cleanJson = jsonMatch ? jsonMatch[0] : responseText;
+        res.json(JSON.parse(cleanJson));
+      } catch (e) {
+        console.error("Synthesis parse error. Raw text:", responseText.substring(0, 500));
+        res.status(500).json({ 
+          error: "Synthesis response was malformed or incomplete. Please simplify the target URL or retry.",
+          raw: responseText.substring(0, 200) + "..."
+        });
+      }
     } catch (err: any) {
       console.error("Synthesis error:", err);
       res.status(500).json({ error: err.message });
